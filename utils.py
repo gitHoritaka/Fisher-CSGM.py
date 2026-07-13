@@ -306,8 +306,18 @@ def plot_cs_summary(summary_rows: list[MetricRow], output_path: Path) -> None:
             method_rows.sort(key=lambda row: int(row["num_measurements"]))
             x = [int(row["num_measurements"]) for row in method_rows]
             y = [float(row[f"{metric}_mean"]) for row in method_rows]
-            yerr = [float(row[f"{metric}_std"]) for row in method_rows]
-            axis.errorbar(x, y, yerr=yerr, marker="o", capsize=3, label=method)
+            y_std = [float(row[f"{metric}_std"]) for row in method_rows]
+            lower = [mean - std for mean, std in zip(y, y_std)]
+            upper = [mean + std for mean, std in zip(y, y_std)]
+            (line,) = axis.plot(x, y, marker="o", label=method)
+            axis.fill_between(
+                x,
+                lower,
+                upper,
+                color=line.get_color(),
+                alpha=0.18,
+                linewidth=0,
+            )
         axis.set_title(f"{title}\n{subtitle}")
         axis.set_xlabel("Measurements")
         axis.grid(True, alpha=0.3)
