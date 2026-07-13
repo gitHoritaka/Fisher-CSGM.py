@@ -105,13 +105,18 @@ def make_random_measurement_matrix(
     device: torch.device,
     image_dim: int = IMAGE_DIM,
 ) -> torch.Tensor:
+    """Create A with shape (num_measurements, image_dim).
+
+    Each row is one linear measurement. Use A[:m] to keep the first m
+    measurements fixed when sweeping over different measurement counts.
+    """
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
     matrix = torch.randn(
         num_measurements,
         image_dim,
         generator=generator,
-    ) / math.sqrt(num_measurements)
+    )
     return matrix.to(device)
 
 
