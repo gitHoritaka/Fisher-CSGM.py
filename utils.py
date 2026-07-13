@@ -298,7 +298,7 @@ def plot_cs_summary(summary_rows: list[MetricRow], output_path: Path) -> None:
     ]
     figure, axes = plt.subplots(1, 3, figsize=(15, 4.5))
 
-    for axis, (metric, title, subtitle) in zip(axes, metrics):
+    for axis, (metric, title) in zip(axes, metrics):
         for method in methods:
             method_rows = [
                 row for row in summary_rows if str(row["method"]) == method
@@ -318,7 +318,7 @@ def plot_cs_summary(summary_rows: list[MetricRow], output_path: Path) -> None:
                 alpha=0.18,
                 linewidth=0,
             )
-        axis.set_title(f"{title}\n{subtitle}")
+        axis.set_title(f"{title}\n")
         axis.set_xlabel("Measurements")
         axis.grid(True, alpha=0.3)
         axis.legend()
