@@ -33,6 +33,7 @@ DEFAULT_CHECKPOINT = BASE_DIR / "outputs" / "vae_mnist" / "vae_mnist_best.pt"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs" / "cs_comparison"
 DEFAULT_MAX_MEASUREMENTS = 200
 DEFAULT_MEASUREMENT_STEP = 5
+DEFAULT_CANDIDATE_MEASUREMENTS = 784
 
 
 def load_vae(
@@ -126,7 +127,7 @@ def lasso_reconstruct(
     return estimate_tensor.view(-1, 1, 28, 28).clamp(0.0, 1.0)
 
 
-def vae_reconstruct(
+def optimize_latent(
     model: VAE,
     matrix: torch.Tensor,
     measurements: torch.Tensor,
@@ -136,6 +137,7 @@ def vae_reconstruct(
     lr: float,
     z_prior_weight: float,
     log_interval: int,
+    initial_z: torch.Tensor | None = None,
 ) -> torch.Tensor:
     batch_size = measurements.shape[0]
     device = measurements.device
@@ -146,7 +148,21 @@ def vae_reconstruct(
         .expand(batch_size, restarts, measurements.shape[1])
         .reshape(candidates, measurements.shape[1])
     )
-    z = torch.randn(candidates, latent_dim, device=device, requires_grad=True)
+    if initial_z is None:
+        z_init = torch.randn(candidates, latent_dim, device=device)
+    else:
+        initial_z = initial_z.detach().to(device)
+        z_init = initial_z[:, None, :].expand(batch_size, restarts, latent_dim).clone()
+        if restarts > 1:
+            z_init[:, 1:, :] = torch.randn(
+                batch_size,
+                restarts - 1,
+                latent_dim,
+                device=device,
+            )
+        z_init = z_init.reshape(candidates, latent_dim)
+
+    z = z_init.requires_grad_(True)
     optimizer = optim.Adam([z], lr=lr)
 
     for step in range(1, steps + 1):
@@ -181,7 +197,227 @@ def vae_reconstruct(
 
         z = z.detach().view(batch_size, restarts, latent_dim)
         z_best = z[torch.arange(batch_size, device=device), best_restart]
+        return z_best
+
+
+def vae_reconstruct(
+    model: VAE,
+    matrix: torch.Tensor,
+    measurements: torch.Tensor,
+    latent_dim: int,
+    restarts: int,
+    steps: int,
+    lr: float,
+    z_prior_weight: float,
+    log_interval: int,
+    initial_z: torch.Tensor | None = None,
+) -> torch.Tensor:
+    z_best = optimize_latent(
+        model,
+        matrix,
+        measurements,
+        latent_dim=latent_dim,
+        restarts=restarts,
+        steps=steps,
+        lr=lr,
+        z_prior_weight=z_prior_weight,
+        log_interval=log_interval,
+        initial_z=initial_z,
+    )
+    with torch.no_grad():
         return model.decode(z_best).clamp(0.0, 1.0)
+
+
+def decoder_jacobian(model: VAE, z: torch.Tensor) -> torch.Tensor:
+    z = z.detach().clone().requires_grad_(True)
+
+    def decode_flat(latent: torch.Tensor) -> torch.Tensor:
+        return model.decode(latent.unsqueeze(0)).flatten()
+
+    return torch.autograd.functional.jacobian(
+        decode_flat,
+        z,
+        create_graph=False,
+        vectorize=True,
+    )
+
+
+def select_next_measurement(
+    candidate_matrix: torch.Tensor,
+    selected_mask: torch.Tensor,
+    jacobian: torch.Tensor,
+    precision: torch.Tensor,
+    noise_var: float,
+) -> tuple[int, torch.Tensor, float]:
+    available_indices = torch.nonzero(~selected_mask, as_tuple=False).flatten()
+    available_matrix = candidate_matrix[available_indices]
+    latent_grads = available_matrix @ jacobian
+    solved = torch.linalg.solve(precision, latent_grads.T).T
+    gains = (latent_grads * solved).sum(dim=1).clamp_min(0.0)
+    scores = 0.5 * torch.log1p(gains / noise_var)
+
+    best_position = int(torch.argmax(scores).item())
+    best_index = int(available_indices[best_position].item())
+    best_grad = latent_grads[best_position]
+    best_score = float(scores[best_position].item())
+    return best_index, best_grad, best_score
+
+
+def rebuild_precision_from_selected(
+    model: VAE,
+    candidate_matrix: torch.Tensor,
+    selected_indices: list[int],
+    z_hat: torch.Tensor,
+    latent_dim: int,
+    prior_precision: float,
+    noise_var: float,
+) -> torch.Tensor:
+    """Rebuild Lambda_t = lambda I + J_G^T A_S^T A_S J_G / sigma^2."""
+    device = candidate_matrix.device
+    precision = prior_precision * torch.eye(latent_dim, device=device)
+    if not selected_indices:
+        return precision
+
+    z_vector = z_hat.squeeze(0)
+    jacobian = decoder_jacobian(model, z_vector)
+    selected_matrix = candidate_matrix[selected_indices]
+    latent_grads = selected_matrix @ jacobian
+    return precision + latent_grads.T @ latent_grads / noise_var
+
+
+def active_reconstruct_image(
+    model: VAE,
+    image: torch.Tensor,
+    label: torch.Tensor,
+    candidate_matrix: torch.Tensor,
+    measurement_counts: list[int],
+    latent_dim: int,
+    args: argparse.Namespace,
+    sample_index: int,
+) -> list[MetricRow]:
+    device = image.device
+    rows: list[MetricRow] = []
+    image_batch = image.unsqueeze(0)
+    label_batch = label.reshape(1)
+    candidate_measurements = measure_images(
+        image_batch,
+        candidate_matrix,
+        args.noise_std,
+    ).squeeze(0)
+
+    selected_indices: list[int] = []
+    selected_mask = torch.zeros(
+        candidate_matrix.shape[0],
+        dtype=torch.bool,
+        device=device,
+    )
+    z_hat = torch.zeros(1, latent_dim, device=device)
+    precision = args.acquisition_prior_precision * torch.eye(latent_dim, device=device)
+    noise_var = max(args.acquisition_noise_var, args.noise_std**2, 1e-8)
+    max_measurements = measurement_counts[-1]
+
+    for num_measurements in measurement_counts:
+        while len(selected_indices) < num_measurements:
+            jacobian = decoder_jacobian(model, z_hat.squeeze(0))
+            next_index, next_grad, next_score = select_next_measurement(
+                candidate_matrix,
+                selected_mask,
+                jacobian,
+                precision,
+                noise_var,
+            )
+            selected_indices.append(next_index)
+            selected_mask[next_index] = True
+            precision = precision + torch.outer(next_grad, next_grad) / noise_var
+            selected_count = len(selected_indices)
+            should_print_progress = (
+                args.active_progress_interval > 0
+                and (
+                    selected_count % args.active_progress_interval == 0
+                    or selected_count == num_measurements
+                    or selected_count == max_measurements
+                )
+            )
+            if should_print_progress:
+                print(
+                    "active-select "
+                    f"sample={sample_index + 1}/{args.num_samples} "
+                    f"selected={selected_count}/{max_measurements} "
+                    f"target={num_measurements} "
+                    f"row={next_index} "
+                    f"score={next_score:.6f}",
+                    flush=True,
+                )
+
+            should_refit = (
+                len(selected_indices) % args.active_refit_interval == 0
+                or len(selected_indices) == num_measurements
+            )
+            if should_refit:
+                active_matrix = candidate_matrix[selected_indices]
+                active_measurements = candidate_measurements[selected_indices].unsqueeze(0)
+                z_hat = optimize_latent(
+                    model,
+                    active_matrix,
+                    active_measurements,
+                    latent_dim=latent_dim,
+                    restarts=args.active_restarts,
+                    steps=args.active_refit_steps,
+                    lr=args.vae_lr,
+                    z_prior_weight=args.z_prior_weight,
+                    log_interval=0,
+                    initial_z=z_hat,
+                )
+                precision = rebuild_precision_from_selected(
+                    model,
+                    candidate_matrix,
+                    selected_indices,
+                    z_hat,
+                    latent_dim,
+                    args.acquisition_prior_precision,
+                    noise_var,
+                )
+
+        matrix = candidate_matrix[selected_indices]
+        measurements = candidate_measurements[selected_indices].unsqueeze(0)
+        z_hat = optimize_latent(
+            model,
+            matrix,
+            measurements,
+            latent_dim=latent_dim,
+            restarts=args.vae_restarts,
+            steps=args.vae_steps,
+            lr=args.vae_lr,
+            z_prior_weight=args.z_prior_weight,
+            log_interval=args.vae_log_interval,
+            initial_z=z_hat,
+        )
+        if len(selected_indices) < max_measurements:
+            precision = rebuild_precision_from_selected(
+                model,
+                candidate_matrix,
+                selected_indices,
+                z_hat,
+                latent_dim,
+                args.acquisition_prior_precision,
+                noise_var,
+            )
+        with torch.no_grad():
+            vae_image = model.decode(z_hat).clamp(0.0, 1.0)
+
+        rows.extend(
+            metric_rows(
+                "active-vae",
+                vae_image,
+                image_batch,
+                label_batch,
+                num_measurements,
+                0,
+                sample_index,
+            )
+        )
+
+    return rows
 
 
 def save_comparison_grid(
@@ -220,7 +456,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-measurements", type=int, default=DEFAULT_MAX_MEASUREMENTS)
     parser.add_argument("--measurement-step", type=int, default=DEFAULT_MEASUREMENT_STEP)
-    parser.add_argument("--num-samples", type=int, default=32)
+    parser.add_argument("--num-samples", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--noise-std", type=float, default=0.0)
@@ -231,6 +467,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-restarts", type=int, default=5)
     parser.add_argument("--vae-lr", type=float, default=5e-2)
     parser.add_argument("--z-prior-weight", type=float, default=1e-3)
+    parser.add_argument(
+        "--measurement-policy",
+        choices=["random", "active", "both"],
+        default="both",
+        help=(
+            "Estimators to run: random gives lasso and random-vae, "
+            "active gives lasso and active-vae, both compares all three."
+        ),
+    )
+    parser.add_argument("--candidate-measurements", type=int, default=DEFAULT_CANDIDATE_MEASUREMENTS)
+    parser.add_argument("--active-refit-steps", type=int, default=100)
+    parser.add_argument("--active-refit-interval", type=int, default=5)
+    parser.add_argument(
+        "--active-progress-interval",
+        type=int,
+        default=5,
+        help="Print active row-selection progress every N selected rows. Use 0 to disable.",
+    )
+    parser.add_argument("--active-restarts", type=int, default=1)
+    parser.add_argument("--acquisition-prior-precision", type=float, default=1.0)
+    parser.add_argument("--acquisition-noise-var", type=float, default=1e-2)
     parser.add_argument("--latent-dim", type=int, default=None)
     parser.add_argument("--hidden-dim", type=int, default=None)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or mps")
@@ -283,85 +540,121 @@ def main() -> None:
         raise ValueError("No measurement counts were provided.")
     if measurement_counts[0] <= 0:
         raise ValueError("--measurements must contain positive integers.")
+    if args.active_refit_interval <= 0:
+        raise ValueError("--active-refit-interval must be a positive integer.")
+    if args.active_progress_interval < 0:
+        raise ValueError("--active-progress-interval must be zero or a positive integer.")
 
     max_measurements = measurement_counts[-1]
+    run_random_vae = args.measurement_policy in {"random", "both"}
+    run_active_vae = args.measurement_policy in {"active", "both"}
+    run_lasso = True
+    if run_active_vae and args.candidate_measurements < max_measurements:
+        raise ValueError("--candidate-measurements must be at least max(measurements).")
+    candidate_measurements = args.candidate_measurements if run_active_vae else max_measurements
     fixed_matrix = make_random_measurement_matrix(
-        max_measurements,
+        candidate_measurements,
         args.seed,
         device,
     )
     print(
-        f"Created one fixed Gaussian A with shape "
-        f"{tuple(fixed_matrix.shape)} for all measurement counts."
+        f"Created Gaussian A with shape {tuple(fixed_matrix.shape)} "
+        f"for policy={args.measurement_policy}."
     )
 
-    for num_measurements in measurement_counts:
-        matrix = fixed_matrix[:num_measurements]
-        print(
-            f"num_measurements={num_measurements} "
-            f"using A[:{num_measurements}]"
-        )
+    if run_lasso or run_random_vae:
+        for num_measurements in measurement_counts:
+            matrix = fixed_matrix[:num_measurements]
+            print(
+                f"num_measurements={num_measurements} "
+                f"using fixed random A[:{num_measurements}]"
+            )
 
+            sample_offset = 0
+            saved_grid = False
+            for images, labels in eval_loader:
+                images = images.to(device, non_blocking=device.type == "cuda")
+                labels = labels.to(device, non_blocking=device.type == "cuda")
+                measurements = measure_images(images, matrix, args.noise_std)
+
+                lasso_images = None
+                vae_images = None
+                if run_lasso:
+                    lasso_images = lasso_reconstruct(
+                        matrix,
+                        measurements,
+                        alpha=args.lasso_alpha,
+                        max_iter=args.lasso_max_iter,
+                        tol=args.lasso_tol,
+                    )
+                    rows.extend(
+                        metric_rows(
+                            "lasso",
+                            lasso_images,
+                            images,
+                            labels,
+                            num_measurements,
+                            0,
+                            sample_offset,
+                        )
+                    )
+
+                if run_random_vae:
+                    vae_images = vae_reconstruct(
+                        model,
+                        matrix,
+                        measurements,
+                        latent_dim=latent_dim,
+                        restarts=args.vae_restarts,
+                        steps=args.vae_steps,
+                        lr=args.vae_lr,
+                        z_prior_weight=args.z_prior_weight,
+                        log_interval=args.vae_log_interval,
+                    )
+                    rows.extend(
+                        metric_rows(
+                            "random-vae",
+                            vae_images,
+                            images,
+                            labels,
+                            num_measurements,
+                            0,
+                            sample_offset,
+                        )
+                    )
+
+                if not saved_grid and lasso_images is not None and vae_images is not None:
+                    save_comparison_grid(
+                        images,
+                        lasso_images,
+                        vae_images,
+                        output_dir / f"comparison_m{num_measurements:04d}.png",
+                        args.grid_images,
+                    )
+                    saved_grid = True
+
+                sample_offset += images.shape[0]
+
+    if run_active_vae:
         sample_offset = 0
-        saved_grid = False
         for images, labels in eval_loader:
             images = images.to(device, non_blocking=device.type == "cuda")
             labels = labels.to(device, non_blocking=device.type == "cuda")
-            measurements = measure_images(images, matrix, args.noise_std)
-
-            lasso_images = lasso_reconstruct(
-                matrix,
-                measurements,
-                alpha=args.lasso_alpha,
-                max_iter=args.lasso_max_iter,
-                tol=args.lasso_tol,
-            )
-            vae_images = vae_reconstruct(
-                model,
-                matrix,
-                measurements,
-                latent_dim=latent_dim,
-                restarts=args.vae_restarts,
-                steps=args.vae_steps,
-                lr=args.vae_lr,
-                z_prior_weight=args.z_prior_weight,
-                log_interval=args.vae_log_interval,
-            )
-
-            rows.extend(
-                metric_rows(
-                    "lasso",
-                    lasso_images,
-                    images,
-                    labels,
-                    num_measurements,
-                    0,
-                    sample_offset,
+            for batch_index in range(images.shape[0]):
+                rows.extend(
+                    active_reconstruct_image(
+                        model,
+                        images[batch_index],
+                        labels[batch_index],
+                        fixed_matrix,
+                        measurement_counts,
+                        latent_dim,
+                        args,
+                        sample_offset + batch_index,
+                    )
                 )
-            )
-            rows.extend(
-                metric_rows(
-                    "vae",
-                    vae_images,
-                    images,
-                    labels,
-                    num_measurements,
-                    0,
-                    sample_offset,
-                )
-            )
-
-            if not saved_grid:
-                save_comparison_grid(
-                    images,
-                    lasso_images,
-                    vae_images,
-                    output_dir / f"comparison_m{num_measurements:04d}.png",
-                    args.grid_images,
-                )
-                saved_grid = True
-
             sample_offset += images.shape[0]
+            print(f"Processed active-vae samples: {sample_offset}/{args.num_samples}")
 
     per_image_path = output_dir / "per_image_metrics.csv"
     summary_path = output_dir / "summary_metrics.csv"
