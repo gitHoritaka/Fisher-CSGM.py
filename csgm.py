@@ -73,7 +73,7 @@ def load_vae(
     return model, resolved_latent_dim, resolved_hidden_dim
 
 
-def build_eval_loader(args: argparse.Namespace) -> DataLoader:
+def build_eval_loader(args: argparse.Namespace, device: torch.device) -> DataLoader:
     dataset = datasets.MNIST(
         root=str(args.data_dir),
         train=False,
@@ -92,6 +92,7 @@ def build_eval_loader(args: argparse.Namespace) -> DataLoader:
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
     )
 
 
@@ -102,6 +103,7 @@ def lasso_reconstruct(
     max_iter: int,
     tol: float,
 ) -> torch.Tensor:
+    """Run sklearn Lasso on CPU, then return estimates on measurements.device."""
     design_matrix = matrix.detach().cpu().numpy()
     measurement_batch = measurements.detach().cpu().numpy()
 
@@ -117,10 +119,9 @@ def lasso_reconstruct(
         lasso.fit(design_matrix, measurement)
         estimates.append(lasso.coef_)
 
-    estimate_tensor = torch.as_tensor(
-        np.asarray(estimates),
-        dtype=measurements.dtype,
+    estimate_tensor = torch.from_numpy(np.asarray(estimates)).to(
         device=measurements.device,
+        dtype=measurements.dtype,
     )
     return estimate_tensor.view(-1, 1, 28, 28).clamp(0.0, 1.0)
 
@@ -265,7 +266,7 @@ def main() -> None:
         f"(latent_dim={latent_dim}, hidden_dim={hidden_dim})"
     )
 
-    eval_loader = build_eval_loader(args)
+    eval_loader = build_eval_loader(args, device)
     rows: list[MetricRow] = []
     if args.measurements is None:
         if args.measurement_step <= 0:
@@ -304,8 +305,8 @@ def main() -> None:
         sample_offset = 0
         saved_grid = False
         for images, labels in eval_loader:
-            images = images.to(device)
-            labels = labels.to(device)
+            images = images.to(device, non_blocking=device.type == "cuda")
+            labels = labels.to(device, non_blocking=device.type == "cuda")
             measurements = measure_images(images, matrix, args.noise_std)
 
             lasso_images = lasso_reconstruct(
