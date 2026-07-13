@@ -6,7 +6,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import optim
-from torch.nn import functional as F
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 from torchvision.utils import save_image
@@ -135,7 +134,8 @@ def optimize_latent(
     restarts: int,
     steps: int,
     lr: float,
-    z_prior_weight: float,
+    prior_precision: float,
+    noise_var: float,
     log_interval: int,
     initial_z: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -169,29 +169,23 @@ def optimize_latent(
         optimizer.zero_grad(set_to_none=True)
         generated = model.decode(z).flatten(start_dim=1)
         predicted = generated @ matrix.T
-        measurement_loss = F.mse_loss(
-            predicted,
-            expanded_measurements,
-            reduction="none",
-        ).mean(dim=1)
-        prior_loss = z.pow(2).sum(dim=1)
-        loss = (measurement_loss + z_prior_weight * prior_loss).mean()
+        residual = predicted - expanded_measurements
+        measurement_loss = residual.pow(2).sum(dim=1) / (2.0 * noise_var)
+        prior_loss = 0.5 * prior_precision * z.pow(2).sum(dim=1)
+        loss = (measurement_loss + prior_loss).mean()
         loss.backward()
         optimizer.step()
 
         if log_interval > 0 and step % log_interval == 0:
-            print(f"vae_step={step:04d} latent_objective={loss.item():.6f}")
+            print(f"vae_step={step:04d} posterior_objective={loss.item():.6f}")
 
     with torch.no_grad():
         generated = model.decode(z).flatten(start_dim=1)
         predicted = generated @ matrix.T
-        measurement_loss = F.mse_loss(
-            predicted,
-            expanded_measurements,
-            reduction="none",
-        ).mean(dim=1)
-        prior_loss = z.pow(2).sum(dim=1)
-        total_loss = measurement_loss + z_prior_weight * prior_loss
+        residual = predicted - expanded_measurements
+        measurement_loss = residual.pow(2).sum(dim=1) / (2.0 * noise_var)
+        prior_loss = 0.5 * prior_precision * z.pow(2).sum(dim=1)
+        total_loss = measurement_loss + prior_loss
         total_loss = total_loss.view(batch_size, restarts)
         best_restart = total_loss.argmin(dim=1)
 
@@ -208,7 +202,8 @@ def vae_reconstruct(
     restarts: int,
     steps: int,
     lr: float,
-    z_prior_weight: float,
+    prior_precision: float,
+    noise_var: float,
     log_interval: int,
     initial_z: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -220,7 +215,8 @@ def vae_reconstruct(
         restarts=restarts,
         steps=steps,
         lr=lr,
-        z_prior_weight=z_prior_weight,
+        prior_precision=prior_precision,
+        noise_var=noise_var,
         log_interval=log_interval,
         initial_z=initial_z,
     )
@@ -364,7 +360,8 @@ def active_reconstruct_image(
                     restarts=args.active_restarts,
                     steps=args.active_refit_steps,
                     lr=args.vae_lr,
-                    z_prior_weight=args.z_prior_weight,
+                    prior_precision=args.acquisition_prior_precision,
+                    noise_var=noise_var,
                     log_interval=0,
                     initial_z=z_hat,
                 )
@@ -388,7 +385,8 @@ def active_reconstruct_image(
             restarts=args.vae_restarts,
             steps=args.vae_steps,
             lr=args.vae_lr,
-            z_prior_weight=args.z_prior_weight,
+            prior_precision=args.acquisition_prior_precision,
+            noise_var=noise_var,
             log_interval=args.vae_log_interval,
             initial_z=z_hat,
         )
@@ -456,7 +454,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-measurements", type=int, default=DEFAULT_MAX_MEASUREMENTS)
     parser.add_argument("--measurement-step", type=int, default=DEFAULT_MEASUREMENT_STEP)
-    parser.add_argument("--num-samples", type=int, default=5)
+    parser.add_argument("--num-samples", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--noise-std", type=float, default=0.0)
@@ -466,7 +464,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-steps", type=int, default=1000)
     parser.add_argument("--vae-restarts", type=int, default=5)
     parser.add_argument("--vae-lr", type=float, default=5e-2)
-    parser.add_argument("--z-prior-weight", type=float, default=1e-3)
+    parser.add_argument(
+        "--z-prior-weight",
+        type=float,
+        default=None,
+        help="Deprecated alias for --acquisition-prior-precision.",
+    )
     parser.add_argument(
         "--measurement-policy",
         choices=["random", "active", "both"],
@@ -477,7 +480,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--candidate-measurements", type=int, default=DEFAULT_CANDIDATE_MEASUREMENTS)
-    parser.add_argument("--active-refit-steps", type=int, default=100)
+    parser.add_argument("--active-refit-steps", type=int, default=200)
     parser.add_argument("--active-refit-interval", type=int, default=5)
     parser.add_argument(
         "--active-progress-interval",
@@ -544,6 +547,16 @@ def main() -> None:
         raise ValueError("--active-refit-interval must be a positive integer.")
     if args.active_progress_interval < 0:
         raise ValueError("--active-progress-interval must be zero or a positive integer.")
+    if args.z_prior_weight is not None:
+        args.acquisition_prior_precision = args.z_prior_weight
+        print(
+            "Using deprecated --z-prior-weight as "
+            f"--acquisition-prior-precision={args.acquisition_prior_precision}."
+        )
+    if args.acquisition_prior_precision <= 0:
+        raise ValueError("--acquisition-prior-precision must be positive.")
+    if args.acquisition_noise_var <= 0:
+        raise ValueError("--acquisition-noise-var must be positive.")
 
     max_measurements = measurement_counts[-1]
     run_random_vae = args.measurement_policy in {"random", "both"}
@@ -557,9 +570,15 @@ def main() -> None:
         args.seed,
         device,
     )
+    posterior_noise_var = max(args.acquisition_noise_var, args.noise_std**2)
     print(
         f"Created Gaussian A with shape {tuple(fixed_matrix.shape)} "
         f"for policy={args.measurement_policy}."
+    )
+    print(
+        "Posterior objective uses "
+        f"prior_precision={args.acquisition_prior_precision} "
+        f"and noise_var={posterior_noise_var}."
     )
 
     if run_lasso or run_random_vae:
@@ -608,7 +627,8 @@ def main() -> None:
                         restarts=args.vae_restarts,
                         steps=args.vae_steps,
                         lr=args.vae_lr,
-                        z_prior_weight=args.z_prior_weight,
+                        prior_precision=args.acquisition_prior_precision,
+                        noise_var=posterior_noise_var,
                         log_interval=args.vae_log_interval,
                     )
                     rows.extend(

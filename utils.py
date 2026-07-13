@@ -112,11 +112,13 @@ def make_random_measurement_matrix(
     seed: int,
     device: torch.device,
     image_dim: int = IMAGE_DIM,
+    normalize_rows: bool = True,
 ) -> torch.Tensor:
     """Create A with shape (num_measurements, image_dim).
 
     Each row is one linear measurement. Use A[:m] to keep the first m
-    measurements fixed when sweeping over different measurement counts.
+    measurements fixed when sweeping over different measurement counts. Row
+    normalization keeps acquisition scores from being dominated by row norms.
     """
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
@@ -125,6 +127,8 @@ def make_random_measurement_matrix(
         image_dim,
         generator=generator,
     )
+    if normalize_rows:
+        matrix = F.normalize(matrix, p=2, dim=1)
     return matrix.to(device)
 
 
@@ -290,7 +294,10 @@ def write_summary_metrics(
 def plot_cs_summary(summary_rows: list[MetricRow], output_path: Path) -> None:
     plt = configure_matplotlib()
 
-    methods = sorted({str(row["method"]) for row in summary_rows})
+    method_names = {str(row["method"]) for row in summary_rows}
+    preferred_order = ["random-vae", "active-vae", "lasso"]
+    methods = [method for method in preferred_order if method in method_names]
+    methods.extend(sorted(method_names - set(methods)))
     metrics = [
         ("rmse", "RMSE"),
         ("psnr", "PSNR"),
