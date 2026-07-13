@@ -28,7 +28,15 @@ def set_seed(seed: int) -> None:
 
 def select_device(name: str) -> torch.device:
     if name != "auto":
-        return torch.device(name)
+        device = torch.device(name)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA was requested, but torch.cuda.is_available() is False.")
+        if (
+            device.type == "mps"
+            and (not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available())
+        ):
+            raise ValueError("MPS was requested, but it is not available.")
+        return device
     if torch.cuda.is_available():
         return torch.device("cuda")
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -284,9 +292,9 @@ def plot_cs_summary(summary_rows: list[MetricRow], output_path: Path) -> None:
 
     methods = sorted({str(row["method"]) for row in summary_rows})
     metrics = [
-        ("rmse", "RMSE", "lower is better"),
-        ("psnr", "PSNR", "higher is better"),
-        ("ssim", "SSIM", "higher is better"),
+        ("rmse", "RMSE"),
+        ("psnr", "PSNR"),
+        ("ssim", "SSIM"),
     ]
     figure, axes = plt.subplots(1, 3, figsize=(15, 4.5))
 
