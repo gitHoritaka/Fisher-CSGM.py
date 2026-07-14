@@ -480,7 +480,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--candidate-measurements", type=int, default=DEFAULT_CANDIDATE_MEASUREMENTS)
-    parser.add_argument("--active-refit-steps", type=int, default=200)
+    parser.add_argument("--active-refit-steps", type=int, default=500)
     parser.add_argument("--active-refit-interval", type=int, default=5)
     parser.add_argument(
         "--active-progress-interval",
