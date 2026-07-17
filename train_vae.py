@@ -24,6 +24,28 @@ from utils import (
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DATA_DIR = BASE_DIR / "data"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs" / "vae_mnist"
+DATASET_CHOICES = ("mnist", "fashion-mnist")
+FASHION_MNIST_MIRROR = (
+    "https://raw.githubusercontent.com/zalandoresearch/"
+    "fashion-mnist/master/data/fashion/"
+)
+
+
+def dataset_slug(dataset_name: str) -> str:
+    return dataset_name.replace("-", "_")
+
+
+def get_dataset_class(dataset_name: str) -> type[datasets.MNIST]:
+    if dataset_name == "mnist":
+        return datasets.MNIST
+    if dataset_name == "fashion-mnist":
+        if FASHION_MNIST_MIRROR not in datasets.FashionMNIST.mirrors:
+            datasets.FashionMNIST.mirrors = [
+                FASHION_MNIST_MIRROR,
+                *datasets.FashionMNIST.mirrors,
+            ]
+        return datasets.FashionMNIST
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
 class VAE(nn.Module):
@@ -101,14 +123,15 @@ def set_seed(seed: int) -> None:
 def build_loaders(args: argparse.Namespace, device: torch.device) -> tuple[DataLoader, DataLoader]:
     transform = transforms.ToTensor()
     data_dir = Path(args.data_dir)
+    dataset_class = get_dataset_class(args.dataset)
 
-    train_dataset = datasets.MNIST(
+    train_dataset = dataset_class(
         root=str(data_dir),
         train=True,
         transform=transform,
         download=not args.no_download,
     )
-    test_dataset = datasets.MNIST(
+    test_dataset = dataset_class(
         root=str(data_dir),
         train=False,
         transform=transform,
@@ -227,9 +250,15 @@ def save_checkpoint(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a VAE on MNIST.")
+    parser = argparse.ArgumentParser(description="Train a VAE on MNIST or Fashion-MNIST.")
+    parser.add_argument("--dataset", choices=DATASET_CHOICES, default="mnist")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Defaults to outputs/vae_<dataset>.",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--latent-dim", type=int, default=20)
@@ -245,7 +274,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-download",
         action="store_true",
-        help="Use an existing MNIST dataset in data-dir instead of downloading.",
+        help="Use an existing dataset in data-dir instead of downloading.",
     )
     return parser.parse_args()
 
@@ -254,10 +283,15 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
 
+    if args.output_dir is None:
+        args.output_dir = BASE_DIR / "outputs" / f"vae_{dataset_slug(args.dataset)}"
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     device = select_device(args.device)
+    checkpoint_prefix = f"vae_{dataset_slug(args.dataset)}"
+    print(f"Dataset: {args.dataset}")
     print(f"Using device: {device}")
 
     train_loader, test_loader = build_loaders(args, device)
@@ -331,12 +365,24 @@ def main() -> None:
                 reconstruction_count=args.reconstruction_count,
                 sample_count=args.sample_count,
             )
-            save_checkpoint(model, optimizer, output_dir, epoch, args, "vae_mnist_last.pt")
+            save_checkpoint(
+                model,
+                optimizer,
+                output_dir,
+                epoch,
+                args,
+                f"{checkpoint_prefix}_last.pt",
+            )
 
             if test_loss < best_test_loss:
                 best_test_loss = test_loss
                 save_checkpoint(
-                    model, optimizer, output_dir, epoch, args, "vae_mnist_best.pt"
+                    model,
+                    optimizer,
+                    output_dir,
+                    epoch,
+                    args,
+                    f"{checkpoint_prefix}_best.pt",
                 )
 
     metrics_plot_path = plot_metrics(metrics_path, output_dir / "metrics.png")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,148 @@ DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs" / "cs_comparison"
 DEFAULT_MAX_MEASUREMENTS = 200
 DEFAULT_MEASUREMENT_STEP = 5
 DEFAULT_CANDIDATE_MEASUREMENTS = 784
+
+
+def make_radon_observation_matrix(
+    num_measurements: int,
+    seed: int,
+    device: torch.device,
+    image_size: int = 28,
+    num_angles: int = 28,
+    num_detectors: int = 28,
+    samples_per_line: int = 112,
+    detector_span: float | None = None,
+    angle_max: float = 180.0,
+    normalize_rows: bool = True,
+) -> torch.Tensor:
+    """Create A with shape (num_measurements, image_size * image_size).
+
+    Each row is a discretized Radon line-integral measurement v=(theta, s).
+    A row stores how much that line contributes to each pixel.
+    """
+    if num_measurements <= 0:
+        raise ValueError("num_measurements must be positive.")
+    if num_angles <= 0:
+        raise ValueError("num_angles must be positive.")
+    if num_detectors <= 0:
+        raise ValueError("num_detectors must be positive.")
+    if samples_per_line < 2:
+        raise ValueError("samples_per_line must be at least 2.")
+    if angle_max <= 0:
+        raise ValueError("angle_max must be positive.")
+
+    center = (image_size - 1) / 2.0
+    radius = math.sqrt(2.0) * center
+    if detector_span is None:
+        detector_span = center
+    if detector_span <= 0:
+        raise ValueError("detector_span must be positive.")
+
+    angles = torch.linspace(
+        0.0,
+        math.radians(angle_max),
+        steps=num_angles + 1,
+        dtype=torch.float32,
+    )[:-1]
+    detector_positions = torch.linspace(
+        -detector_span,
+        detector_span,
+        steps=num_detectors,
+        dtype=torch.float32,
+    )
+    line_positions = torch.linspace(-radius, radius, steps=samples_per_line)
+    line_step = float(line_positions[1] - line_positions[0])
+
+    rows: list[torch.Tensor] = []
+    for theta in angles:
+        normal_x = torch.cos(theta)
+        normal_y = torch.sin(theta)
+        tangent_x = -torch.sin(theta)
+        tangent_y = torch.cos(theta)
+
+        for detector_position in detector_positions:
+            x = detector_position * normal_x + line_positions * tangent_x
+            y = detector_position * normal_y + line_positions * tangent_y
+
+            col = x + center
+            row = center - y
+            inside = (
+                (row >= 0.0)
+                & (row <= image_size - 1)
+                & (col >= 0.0)
+                & (col <= image_size - 1)
+            )
+            weights = torch.zeros(image_size, image_size, dtype=torch.float32)
+            if torch.any(inside):
+                row = row[inside]
+                col = col[inside]
+                row0 = torch.floor(row).long()
+                col0 = torch.floor(col).long()
+                row1 = torch.clamp(row0 + 1, max=image_size - 1)
+                col1 = torch.clamp(col0 + 1, max=image_size - 1)
+                row_frac = row - row0.float()
+                col_frac = col - col0.float()
+
+                contributions = [
+                    (row0, col0, (1.0 - row_frac) * (1.0 - col_frac)),
+                    (row0, col1, (1.0 - row_frac) * col_frac),
+                    (row1, col0, row_frac * (1.0 - col_frac)),
+                    (row1, col1, row_frac * col_frac),
+                ]
+                for row_index, col_index, value in contributions:
+                    weights.index_put_(
+                        (row_index, col_index),
+                        value * line_step,
+                        accumulate=True,
+                    )
+
+            flat_weights = weights.flatten()
+            if normalize_rows:
+                norm = flat_weights.norm()
+                if norm > 0:
+                    flat_weights = flat_weights / norm
+            rows.append(flat_weights)
+
+    matrix = torch.stack(rows)
+    nonzero_rows = matrix.norm(dim=1) > 0
+    matrix = matrix[nonzero_rows]
+    if num_measurements > matrix.shape[0]:
+        raise ValueError(
+            "Radon candidate pool is too small after removing zero-length "
+            f"lines: requested {num_measurements}, but only "
+            f"{matrix.shape[0]} nonzero candidates are available."
+        )
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    order = torch.randperm(matrix.shape[0], generator=generator)
+    return matrix[order[:num_measurements]].to(device)
+
+
+def make_observation_matrix(
+    args: argparse.Namespace,
+    num_measurements: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if args.measurement_type == "gaussian":
+        return make_random_measurement_matrix(
+            num_measurements,
+            args.seed,
+            device,
+        )
+    if args.measurement_type == "radon":
+        return make_radon_observation_matrix(
+            num_measurements,
+            args.seed,
+            device,
+            num_angles=args.radon_num_angles,
+            num_detectors=args.radon_num_detectors,
+            samples_per_line=args.radon_samples_per_line,
+            detector_span=args.radon_detector_span,
+            angle_max=args.radon_angle_max,
+            normalize_rows=args.radon_normalize_rows,
+        )
+    raise ValueError(f"Unsupported measurement_type: {args.measurement_type}")
 
 
 def load_vae(
@@ -311,6 +454,29 @@ def active_reconstruct_image(
     precision = args.acquisition_prior_precision * torch.eye(latent_dim, device=device)
     noise_var = max(args.acquisition_noise_var, args.noise_std**2, 1e-8)
     max_measurements = measurement_counts[-1]
+    shared_measurements = min(
+        args.active_shared_random_measurements,
+        max_measurements,
+        candidate_matrix.shape[0],
+    )
+    if shared_measurements > 0:
+        selected_indices.extend(range(shared_measurements))
+        selected_mask[:shared_measurements] = True
+        precision = rebuild_precision_from_selected(
+            model,
+            candidate_matrix,
+            selected_indices,
+            z_hat,
+            latent_dim,
+            args.acquisition_prior_precision,
+            noise_var,
+        )
+        print(
+            "active-init-random "
+            f"sample={sample_index + 1}/{args.num_samples} "
+            f"selected={shared_measurements}/{max_measurements}",
+            flush=True,
+        )
 
     for num_measurements in measurement_counts:
         while len(selected_indices) < num_measurements:
@@ -450,10 +616,27 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         default=None,
-        help="Numbers of nested random Gaussian measurements to test.",
+        help="Numbers of nested measurements to test.",
     )
     parser.add_argument("--max-measurements", type=int, default=DEFAULT_MAX_MEASUREMENTS)
     parser.add_argument("--measurement-step", type=int, default=DEFAULT_MEASUREMENT_STEP)
+    parser.add_argument(
+        "--measurement-type",
+        choices=["radon", "gaussian"],
+        default="radon",
+        help="Use structured Radon line-integral rows or Gaussian random rows.",
+    )
+    parser.add_argument("--radon-num-angles", type=int, default=28)
+    parser.add_argument("--radon-num-detectors", type=int, default=28)
+    parser.add_argument("--radon-samples-per-line", type=int, default=112)
+    parser.add_argument("--radon-detector-span", type=float, default=None)
+    parser.add_argument("--radon-angle-max", type=float, default=180.0)
+    parser.add_argument(
+        "--radon-normalize-rows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize each Radon row to unit L2 norm.",
+    )
     parser.add_argument("--num-samples", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -482,6 +665,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-measurements", type=int, default=DEFAULT_CANDIDATE_MEASUREMENTS)
     parser.add_argument("--active-refit-steps", type=int, default=500)
     parser.add_argument("--active-refit-interval", type=int, default=5)
+    parser.add_argument(
+        "--active-shared-random-measurements",
+        type=int,
+        default=5,
+        help=(
+            "Start active-vae from the same first N fixed random/candidate rows "
+            "used by random-vae before Fisher selection begins."
+        ),
+    )
     parser.add_argument(
         "--active-progress-interval",
         type=int,
@@ -545,6 +737,8 @@ def main() -> None:
         raise ValueError("--measurements must contain positive integers.")
     if args.active_refit_interval <= 0:
         raise ValueError("--active-refit-interval must be a positive integer.")
+    if args.active_shared_random_measurements < 0:
+        raise ValueError("--active-shared-random-measurements must be non-negative.")
     if args.active_progress_interval < 0:
         raise ValueError("--active-progress-interval must be zero or a positive integer.")
     if args.z_prior_weight is not None:
@@ -565,14 +759,14 @@ def main() -> None:
     if run_active_vae and args.candidate_measurements < max_measurements:
         raise ValueError("--candidate-measurements must be at least max(measurements).")
     candidate_measurements = args.candidate_measurements if run_active_vae else max_measurements
-    fixed_matrix = make_random_measurement_matrix(
+    fixed_matrix = make_observation_matrix(
+        args,
         candidate_measurements,
-        args.seed,
         device,
     )
     posterior_noise_var = max(args.acquisition_noise_var, args.noise_std**2)
     print(
-        f"Created Gaussian A with shape {tuple(fixed_matrix.shape)} "
+        f"Created {args.measurement_type} A with shape {tuple(fixed_matrix.shape)} "
         f"for policy={args.measurement_policy}."
     )
     print(
@@ -586,7 +780,7 @@ def main() -> None:
             matrix = fixed_matrix[:num_measurements]
             print(
                 f"num_measurements={num_measurements} "
-                f"using fixed random A[:{num_measurements}]"
+                f"using fixed {args.measurement_type} A[:{num_measurements}]"
             )
 
             sample_offset = 0
@@ -648,7 +842,8 @@ def main() -> None:
                         images,
                         lasso_images,
                         vae_images,
-                        output_dir / f"comparison_m{num_measurements:04d}.png",
+                        output_dir
+                        / f"{args.measurement_type}_comparison_m{num_measurements:04d}.png",
                         args.grid_images,
                     )
                     saved_grid = True
@@ -676,9 +871,10 @@ def main() -> None:
             sample_offset += images.shape[0]
             print(f"Processed active-vae samples: {sample_offset}/{args.num_samples}")
 
-    per_image_path = output_dir / "per_image_metrics.csv"
-    summary_path = output_dir / "summary_metrics.csv"
-    plot_path = output_dir / "metric_comparison.png"
+    output_prefix = args.measurement_type
+    per_image_path = output_dir / f"{output_prefix}_per_image_metrics.csv"
+    summary_path = output_dir / f"{output_prefix}_summary_metrics.csv"
+    plot_path = output_dir / f"{output_prefix}_metric_comparison.png"
 
     write_per_image_metrics(rows, per_image_path)
     summary_rows = summarize_metrics(rows)
